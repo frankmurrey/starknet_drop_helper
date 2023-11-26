@@ -45,15 +45,18 @@ class ModuleExecutor:
 
         self.wallet_data = wallet
 
-    async def start(self) -> bool:
+    async def start(self) -> ModuleExecutionResult:
         print_module_config(task=self.task)
         time.sleep(cfg.DEFAULT_DELAY_SEC)
 
         if not self.app_config.rpc_url:
             logger.error("Please, set RPC URL in tools window or app_config.json file")
-            return False
+            return ModuleExecutionResult(
+                execution_status=False,
+                execution_info="Set RPC URL in tools window or app_config.json file",
+            )
 
-        execute_status: bool = await self.execute_module(
+        execute_status: ModuleExecutionResult = await self.execute_module(
             wallet_data=self.wallet_data, base_url=self.app_config.rpc_url
         )
 
@@ -63,7 +66,7 @@ class ModuleExecutor:
             self,
             wallet_data: WalletData,
             base_url: str
-    ) -> Union[bool, None]:
+    ) -> Union[ModuleExecutionResult, None]:
         proxy_data = wallet_data.proxy
         proxy_manager = ProxyManager(proxy_data)
 
@@ -80,13 +83,24 @@ class ModuleExecutor:
         current_ip = await proxy_manager.get_ip()
         if current_ip is None and proxy_data:
             err_msg = f"Proxy {wallet_data.proxy.host}:{wallet_data.proxy.port} is not valid or bad auth params"
-            logger.error(err_msg)
+            action_log_data.set_error(err_msg)
+
+            action_log_data.module_name = self.module_name.value
+            action_log_data.module_type = self.module_type.value
 
             action_log_data.is_success = False
             action_log_data.status = err_msg
-            return False
 
-        logger.info(f"Current ip: {current_ip}")
+            action_logger = ActionLogger()
+            action_logger.add_action_to_log_storage(action_data=action_log_data)
+            action_logger.log_action_from_storage()
+
+            return ModuleExecutionResult(
+                execution_status=False,
+                execution_info=err_msg,
+            )
+
+        logger.info(f"Current ip: {current_ip}\n")
 
         client = FullNodeClient(node_url=base_url, session=custom_session)
 
@@ -96,21 +110,16 @@ class ModuleExecutor:
                 session=custom_session
             )
             status, gas_price = await gas_price.check_loop(
-                target_price_wei=self.app_config.target_gas_price * 10 ** 9,
-                time_out_sec=self.app_config.time_to_wait_target_gas_price_sec,
-                is_timeout_needed=self.app_config.is_gas_price_wait_timeout_needed
+                target_price_gwei=self.app_config.target_gas_price,
             )
 
             if gas_price is None:
-                logger.error(f"Error while getting gas price")
-                return False
-
-            if status is False:
-                logger.error(
-                    f"Gas price is too high ({gas_price / 10 ** 9} Gwei) after "
-                    f"{self.app_config.time_to_wait_target_gas_price_sec}. Aborting transaction."
+                err_msg = f"Error while getting gas price"
+                action_log_data.set_error(err_msg)
+                return ModuleExecutionResult(
+                    execution_status=False,
+                    execution_info=err_msg,
                 )
-                return False
 
             logger.info(
                 f"Gas price is under target value ({self.app_config.target_gas_price}), "
@@ -175,4 +184,4 @@ class ModuleExecutor:
         await custom_session.close()
         await proxy_manager.close_connector()
 
-        return execution_status.execution_status
+        return execution_status

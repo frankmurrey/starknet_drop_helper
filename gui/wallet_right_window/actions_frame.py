@@ -1,6 +1,6 @@
 import tkinter.messagebox
 from tkinter import Variable, filedialog
-from typing import List, Union, Callable
+from typing import List, Dict, Union, Callable, TYPE_CHECKING
 from uuid import UUID
 
 import customtkinter
@@ -8,7 +8,8 @@ from loguru import logger
 
 from src.schemas.tasks import TaskBase
 from src.schemas.wallet_data import WalletData
-from src.tasks_executor import tasks_executor
+# from src.tasks_executor import task_executor
+from src.tasks_executor.threaded import threaded_task_executor as task_executor
 from src.storage import ActionStorage
 from src.storage import Storage
 from utils.file_manager import FileManager
@@ -18,6 +19,9 @@ from gui.modules.frames import FloatSpinbox
 from gui.wallet_right_window.wallets_table import WalletsTable
 from src import enums
 
+if TYPE_CHECKING:
+    from gui.wallet_right_window.right_frame import RightFrame
+
 
 class ActionsFrame(customtkinter.CTkFrame):
     def __init__(
@@ -26,13 +30,13 @@ class ActionsFrame(customtkinter.CTkFrame):
             **kwargs):
         super().__init__(master, **kwargs)
 
-        tasks_executor.event_manager.on_wallet_started(self.on_wallet_started)
-        tasks_executor.event_manager.on_task_started(self.on_task_started)
+        task_executor.event_manager.on_wallet_started(self.on_wallet_started)
+        task_executor.event_manager.on_task_started(self.on_task_started)
 
-        tasks_executor.event_manager.on_task_completed(self.on_task_completed)
-        tasks_executor.event_manager.on_wallet_completed(self.on_wallet_completed)
+        task_executor.event_manager.on_task_completed(self.on_task_completed)
+        task_executor.event_manager.on_wallet_completed(self.on_wallet_completed)
 
-        self.master = master
+        self.master: 'RightFrame' = master
         self.wallets_table: WalletsTable = self.master.wallets_table
 
         self.app_config = Storage().app_config
@@ -40,7 +44,12 @@ class ActionsFrame(customtkinter.CTkFrame):
         self.grid_rowconfigure((0, 1, 3, 4), weight=1)
         self.grid_columnconfigure(1, weight=0)
 
-        self.is_running = False
+        self.active_wallet = None
+
+        self.failed_wallets_amount = 0
+        self.completed_wallets_amount = 0
+
+        self.wallets_completed_tasks: Dict[UUID, List[TaskBase]] = {}
 
         self.action_storage = ActionStorage()
         self.actions: List[dict] = []
@@ -113,6 +122,21 @@ class ActionsFrame(customtkinter.CTkFrame):
             sticky="w"
         )
 
+    def get_wallet_actions(
+            self,
+            wallet_id: UUID
+    ) -> List[TaskBase]:
+        for key, values in self.wallets_completed_tasks.items():
+            value: List[TaskBase]
+            if key == wallet_id:
+                return [task for task in values]
+
+        return []
+
+    @property
+    def is_running(self):
+        return task_executor.is_running()
+
     @property
     def tasks(self):
         tasks = []
@@ -124,6 +148,7 @@ class ActionsFrame(customtkinter.CTkFrame):
             task.min_delay_sec = int(self.run_settings_frame.min_delay_entry_spinbox.entry.get())
             task.max_delay_sec = self.run_settings_frame.max_delay_entry_spinbox.entry.get()
             task.wait_for_receipt = bool(self.run_settings_frame.wait_for_receipt_checkbox.get())
+            task.retries = int(self.run_settings_frame.retries_spinbox.entry.get())
 
             txn_wait_timeout_sec = self.run_settings_frame.txn_wait_timeout_seconds_spinbox.entry.get()
             task.txn_wait_timeout_sec = int(txn_wait_timeout_sec) if txn_wait_timeout_sec else 120
@@ -265,11 +290,11 @@ class ActionsFrame(customtkinter.CTkFrame):
         self.current_wallet_action_items = []
         self.redraw_current_actions_frame()
 
-    def set_running_state(self, is_running: bool):
-        self.is_running = is_running
-
     def on_wallet_started(self, started_wallet: "WalletData"):
         wallet_item = self.wallets_table.get_wallet_item_by_wallet_id(wallet_id=started_wallet.wallet_id)
+        self.active_wallet = wallet_item
+        self.master.update_active_wallet_label(wallet_name=started_wallet.name)
+        self.wallets_completed_tasks[started_wallet.wallet_id] = []
         wallet_item.set_wallet_active()
 
     def on_task_started(self, started_task: "TaskBase", current_wallet: "WalletData"):
@@ -282,26 +307,57 @@ class ActionsFrame(customtkinter.CTkFrame):
         if action_item is None:
             return
 
+        self.wallets_completed_tasks[current_wallet.wallet_id].append(completed_task)
+
         if completed_task.task_status == enums.TaskStatus.SUCCESS:
             action_item.set_task_completed()
-        else:
+        elif completed_task.task_status == enums.TaskStatus.FAILED:
             action_item.set_task_failed()
 
     def on_wallet_completed(self, completed_wallet: "WalletData"):
-        wallet_item =  self.wallets_table.get_wallet_item_by_wallet_id(wallet_id=completed_wallet.wallet_id)
+        wallet_item = self.wallets_table.get_wallet_item_by_wallet_id(wallet_id=completed_wallet.wallet_id)
         wallet_item.set_wallet_completed()
         if not self.current_wallet_action_items:
             return
 
-        self.set_running_state(False)
+        self.completed_wallets_amount += 1
+        if self.is_wallet_failed(wallet_id=completed_wallet.wallet_id):
+            wallet_item.set_wallet_failed()
+            self.failed_wallets_amount += 1
+        else:
+            wallet_item.set_wallet_completed()
+
+        self.active_wallet = None
+        self.master.update_wallets_stats_labels(
+            completed_wallets=self.completed_wallets_amount,
+            failed_wallets=self.failed_wallets_amount
+        )
+
+        self.master.update_active_wallet_label(wallet_name="None")
 
         for action_item in self.current_wallet_action_items:
             action_item.set_task_empty()
 
+    def is_wallet_failed(self, wallet_id: UUID) -> bool:
+        for key, values in self.wallets_completed_tasks.items():
+            value: List[TaskBase]
+            if key == wallet_id:
+                for task in values:
+
+                    if task.task_status == enums.TaskStatus.FAILED:
+                        return True
+
+        return False
+
     def on_start_button_click(self):
 
-        if tasks_executor.is_running():
+        if task_executor.is_running():
             return
+
+        self.completed_wallets_amount = 0
+        self.failed_wallets_amount = 0
+
+        self.master.update_wallets_stats_labels(0, 0)
 
         for wallet_item in self.wallets_table.wallets_items:
             wallet_item.set_wallet_inactive()
@@ -337,9 +393,7 @@ class ActionsFrame(customtkinter.CTkFrame):
             amount = self.app_config.wallets_amount_to_execute_in_test_mode
             wallets = wallets[:amount]
 
-        self.set_running_state(True)
-
-        tasks_executor.process(
+        task_executor.process(
             wallets=wallets,
             tasks=self.tasks,
             shuffle_wallets=bool(self.run_settings_frame.shuffle_wallets_checkbox.get()),
@@ -347,9 +401,11 @@ class ActionsFrame(customtkinter.CTkFrame):
         )
 
     def on_stop_button_click(self):
+        for action_item in self.action_items:
+            action_item.set_task_empty()
+
         logger.critical("Stopped tasks processing")
-        self.set_running_state(False)
-        tasks_executor.stop()
+        task_executor.stop()
 
 
 class TableTopFrame(customtkinter.CTkFrame):
@@ -651,6 +707,7 @@ class ButtonActionsFrame(customtkinter.CTkFrame):
             )
             return
 
+        self.parent.remove_all_actions()
         self.parent.set_actions(actions)
         self.parent.run_settings_frame.upload_from_config(run_settings_config)
 
@@ -803,7 +860,7 @@ class RunSettingsFrame(customtkinter.CTkFrame):
                                                              width=105)
         self.txn_wait_timeout_seconds_spinbox.entry.configure(
             state="normal",
-            textvariable=Variable(value=120)
+            textvariable=Variable(value=240)
         )
         self.txn_wait_timeout_seconds_spinbox.add_button.configure(
             state="normal"

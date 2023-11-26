@@ -56,14 +56,13 @@ class MySwap(MySwapBase, SwapModuleBase):
         if reserves_data is None:
             return None
 
-        amount_in_wei = await self.get_amount_in(
+        amount_in_and_fee = await self.get_amount_in_and_dao_fee(
             reserves_data=reserves_data,
             amount_out_wei=amount_out_wei,
             coin_x_obj=self.coin_x,
             coin_y_obj=self.coin_y,
-            slippage=int(self.task.slippage))
-
-        if amount_in_wei is None:
+        )
+        if amount_in_and_fee is None:
             return None
 
         approve_call = self.build_token_approve_call(
@@ -71,6 +70,12 @@ class MySwap(MySwapBase, SwapModuleBase):
             spender=hex(self.router_contract.address),
             amount_wei=int(amount_out_wei)
         )
+
+        amount_x_wei, dao_fee = amount_in_and_fee
+
+        amount_x_wei_after_slippage = amount_x_wei - (amount_x_wei * int(self.task.slippage) / 100)
+        amount_x_wei_after_slippage *= 1 - (dao_fee / 100000)
+
         swap_call = self.build_call(
             to_addr=self.router_contract.address,
             func_name='swap',
@@ -78,7 +83,7 @@ class MySwap(MySwapBase, SwapModuleBase):
                        self.i16(self.coin_x.contract_address),
                        amount_out_wei,
                        0,
-                       amount_in_wei,
+                       amount_x_wei_after_slippage,
                        0]
         )
         calls = [approve_call, swap_call]
@@ -86,7 +91,7 @@ class MySwap(MySwapBase, SwapModuleBase):
         return TransactionPayloadData(
             calls=calls,
             amount_x_decimals=amount_out_wei / 10 ** self.token_x_decimals,
-            amount_y_decimals=amount_in_wei / 10 ** self.token_y_decimals
+            amount_y_decimals=amount_x_wei / 10 ** self.token_y_decimals
         )
 
     async def build_reverse_txn_payload_data(self) -> Union[TransactionPayloadData, None]:
@@ -119,13 +124,13 @@ class MySwap(MySwapBase, SwapModuleBase):
         if reserves_data is None:
             return None
 
-        amount_in_x_wei = await self.get_amount_in(
+        amount_in_and_fee = await self.get_amount_in_and_dao_fee(
             reserves_data=reserves_data,
             amount_out_wei=amount_out_y_wei,
             coin_x_obj=self.coin_y,
-            coin_y_obj=self.coin_x,
-            slippage=int(self.task.slippage))
-        if amount_in_x_wei is None:
+            coin_y_obj=self.coin_x
+        )
+        if amount_in_and_fee is None:
             return None
 
         approve_call = self.build_token_approve_call(
@@ -134,6 +139,11 @@ class MySwap(MySwapBase, SwapModuleBase):
             amount_wei=int(amount_out_y_wei)
         )
 
+        amount_x_wei, dao_fee = amount_in_and_fee
+
+        amount_x_wei_after_slippage = amount_x_wei - (amount_x_wei * int(self.task.slippage) / 100)
+        amount_x_wei_after_slippage *= 1 - (dao_fee / 100000)
+
         swap_call = self.build_call(
             to_addr=self.router_contract.address,
             func_name='swap',
@@ -141,7 +151,7 @@ class MySwap(MySwapBase, SwapModuleBase):
                        self.i16(self.coin_y.contract_address),
                        amount_out_y_wei,
                        0,
-                       amount_in_x_wei,
+                       amount_x_wei_after_slippage,
                        0]
         )
 
@@ -150,7 +160,7 @@ class MySwap(MySwapBase, SwapModuleBase):
         return TransactionPayloadData(
             calls=calls,
             amount_x_decimals=amount_out_y_wei / 10 ** self.token_x_decimals,
-            amount_y_decimals=amount_in_x_wei / 10 ** self.token_y_decimals
+            amount_y_decimals=amount_x_wei / 10 ** self.token_y_decimals
         )
 
     async def send_txn(self) -> ModuleExecutionResult:
@@ -173,7 +183,7 @@ class MySwap(MySwapBase, SwapModuleBase):
             account=self.account,
             txn_payload_data=txn_payload_data
         )
-        if txn_status is False:
+        if txn_status.execution_status is False:
             self.module_execution_result.execution_info = f"Failed to send swap type txn"
             return self.module_execution_result
 

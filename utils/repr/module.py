@@ -114,6 +114,8 @@ def print_module_config(task: TaskBase):
         "task_id",
         "task_status",
         "reverse_action_task",
+        'result_info',
+        'result_hash',
     })
 
     max_key_width = max(len(key) for key in task_dict.keys())
@@ -209,7 +211,7 @@ if __name__ == '__main__':
         test_mode=True,
         max_fee=6000000,
         wait_for_receipt=True,
-        txn_wait_timeout_sec=120,
+        txn_wait_timeout_sec=240,
         reverse_action=True,
 
     )
